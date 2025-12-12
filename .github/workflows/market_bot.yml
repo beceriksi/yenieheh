@@ -2,7 +2,8 @@ name: market-direction-bot
 
 on:
   schedule:
-    # Her 4 saatte bir (UTC) -> 4H kapanışlarını yakalar
+    # Her 4 saatte bir (UTC). 3:05, 7:05, 11:05, 15:05, 19:05, 23:05 UTC
+    # Türkiye saatiyle: 06:05, 10:05, 14:05, 18:05, 22:05, 02:05
     - cron: "5 */4 * * *"
   workflow_dispatch:
 
