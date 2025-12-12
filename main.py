@@ -3,7 +3,6 @@ import time
 import math
 import requests
 from datetime import datetime, timezone
-
 import pandas as pd
 
 OKX_BASE = "https://www.okx.com"
@@ -13,650 +12,446 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 
-# ----------------- Yardımcılar ----------------- #
+# ---------------------- Genel Yardımcılar ---------------------- #
 
-def ts() -> str:
+def ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def send_telegram(text: str):
+    """
+    Telegram'a güvenli mesaj gönderimi.
+    """
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("[UYARI] TELEGRAM_TOKEN veya CHAT_ID tanımlı değil. Mesaj gönderilmeyecek.")
-        print("------ MESAJ ------")
+        print("\n[UYARI] Telegram TOKEN veya CHAT_ID yok. Mesaj gösteriliyor:")
         print(text)
-        print("-------------------")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
+    payload = {'chat_id': CHAT_ID, 'text': text, 'disable_web_page_preview': True}
+
     try:
         r = requests.post(url, data=payload, timeout=10)
         if r.status_code != 200:
-            print("[HATA] Telegram mesajı gönderilemedi:", r.text)
+            print("[HATA] Telegram gönderilemedi:", r.text)
     except Exception as e:
-        print("[HATA] Telegram isteğinde hata:", e)
+        print("[HATA] Telegram hatası:", e)
 
+
+# ---------------------- OKX GET Wrapper ---------------------- #
 
 def jget_okx(path, params=None, retries=5, timeout=10):
     """
-    OKX GET isteği, hata ve rate limit toleranslı.
-    Başarılı olursa data listesi döner, aksi halde [] döner.
+    OKX API için güvenli, retry destekli GET fonksiyonu.
     """
     url = f"{OKX_BASE}{path}"
+
     for attempt in range(retries):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code != 200:
-                print(f"[HATA] HTTP {r.status_code}: {url}")
                 time.sleep(1)
                 continue
 
             data = r.json()
+
             if "code" not in data:
-                print("[HATA] OKX JSON formatı beklenmedik:", data)
                 time.sleep(1)
                 continue
 
+            # OKX success code: "0"
             if data["code"] != "0":
-                # Örn: "2" -> system busy
-                print(f"[OKX HATA] code={data['code']} msg={data.get('msg')}")
+                print(f"[OKX] code={data['code']} msg={data.get('msg')}")
                 time.sleep(1)
                 continue
 
             return data.get("data", [])
 
-        except Exception as e:
-            print(f"[HATA] OKX isteğinde hata: {e}")
+        except Exception:
             time.sleep(1)
 
-    print(f"[HATA] OKX yanıtı {retries} denemede alınamadı: {url}")
+    print(f"[HATA] OKX isteği başarısız -> {url}")
     return []
 
 
-def get_candles(inst_id: str, bar: str, limit: int = 200) -> pd.DataFrame | None:
+# ---------------------- Mum Verisi ---------------------- #
+
+def get_candles(inst, bar, limit=200):
     """
-    OKX mumları:
-    [ ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm ]
-    Yeni -> eski geliyor, biz ters çevirip eski -> yeni yapıyoruz.
+    Candle datasını alır, parse eder ve DataFrame döner.
     """
-    raw = jget_okx(
-        "/api/v5/market/candles",
-        {"instId": inst_id, "bar": bar, "limit": limit}
-    )
+    raw = jget_okx("/api/v5/market/candles",
+                   {"instId": inst, "bar": bar, "limit": limit})
 
     if not raw or len(raw) < 5:
-        print(f"[HATA] {inst_id} için yeterli mum verisi alınamadı ({bar})")
+        print(f"[HATA] {inst} için {bar} mum verisi yok.")
         return None
 
-    raw = list(reversed(raw))  # eskiden yeniye
+    raw = list(reversed(raw))
     rows = []
 
-    for row in raw:
+    for r in raw:
         try:
-            ts_ms = int(row[0])
             rows.append({
-                "ts": datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
-                "open": float(row[1]),
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
-                "volume": float(row[5]),
+                "ts": datetime.fromtimestamp(int(r[0]) / 1000, tz=timezone.utc),
+                "open": float(r[1]),
+                "high": float(r[2]),
+                "low": float(r[3]),
+                "close": float(r[4]),
+                "volume": float(r[5])
             })
-        except Exception as e:
-            print("[UYARI] Candle satırı parse edilemedi, atlanıyor:", row, "Hata:", e)
+        except:
             continue
 
-    if len(rows) < 50:
-        print(f"[UYARI] {inst_id} — Yetersiz mum sayısı ({len(rows)})")
+    if len(rows) < 30:
         return None
 
     return pd.DataFrame(rows)
 
 
-def get_trades_whale(inst_id: str, limit: int = 200):
-    """
-    OKX trades:
-    [ instId, tradeId, px, sz, side, ts ]
-    Whale / net delta hesaplar.
-    """
-    data = jget_okx("/api/v5/market/trades", {"instId": inst_id, "limit": limit})
-    if not data:
-        return {
-            "net_delta": 0.0,
-            "whale_category": "-",
-            "whale_side_dir": None,
-        }
+# ---------------------- Whale / Net Flow ---------------------- #
 
-    buy_val = 0.0
-    sell_val = 0.0
-    max_trade_val = 0.0
-    max_trade_side = None
+def get_trade_flow(inst):
+    """
+    OKX spot trade verisinden net USD akışını hesaplar.
+    Yeni OKX API formatıyla %100 uyumlu.
+    """
+    data = jget_okx("/api/v5/market/trades",
+                    {"instId": inst, "limit": 200})
+
+    if not data or not isinstance(data, list):
+        return {"net": 0, "cat": "-", "dir": None}
+
+    buy_usd = 0
+    sell_usd = 0
+    max_size = 0
+    max_side = None
 
     for t in data:
         try:
-            px = float(t[2])
-            sz = float(t[3])
-            side = t[4]  # buy / sell
-            value = px * sz  # yaklaşık USDT değeri
+            px = float(t["px"])
+            sz = float(t["sz"])
+            usd = px * sz
+            side = t["side"]
 
             if side == "buy":
-                buy_val += value
+                buy_usd += usd
             else:
-                sell_val += value
+                sell_usd += usd
 
-            if value > max_trade_val:
-                max_trade_val = value
-                max_trade_side = side
-        except Exception as e:
-            print("[UYARI] Trade satırı parse edilemedi, atlanıyor:", t, "Hata:", e)
+            if usd > max_size:
+                max_size = usd
+                max_side = side
+
+        except:
             continue
 
-    net_delta = buy_val - sell_val
-
-    # Whale kategorisi
-    if max_trade_val >= 1_000_000:
+    # whale kategorisi
+    if max_size >= 1_000_000:
         cat = "XXL"
-    elif max_trade_val >= 500_000:
+    elif max_size >= 500_000:
         cat = "XL"
-    elif max_trade_val >= 150_000:
+    elif max_size >= 150_000:
         cat = "L"
-    elif max_trade_val >= 50_000:
+    elif max_size >= 50_000:
         cat = "M"
     else:
         cat = "-"
 
-    if max_trade_side == "buy":
-        whale_side_dir = "UP"
-    elif max_trade_side == "sell":
-        whale_side_dir = "DOWN"
-    else:
-        whale_side_dir = None
-
     return {
-        "net_delta": net_delta,
-        "whale_category": cat,
-        "whale_side_dir": whale_side_dir,
+        "net": buy_usd - sell_usd,
+        "cat": cat,
+        "dir": "UP" if max_side == "buy" else "DOWN" if max_side == "sell" else None
     }
-# ----------------- İndikatörler & Yapı ----------------- #
+# ---------------------- İndikatörler ---------------------- #
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def add_indicators(df):
     close = df["close"]
 
-    # EMA'lar
     df["ema_fast"] = close.ewm(span=14, adjust=False).mean()
     df["ema_slow"] = close.ewm(span=28, adjust=False).mean()
 
-    # MACD
-    ema_12 = close.ewm(span=12, adjust=False).mean()
-    ema_26 = close.ewm(span=26, adjust=False).mean()
-    df["macd"] = ema_12 - ema_26
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df["macd"] = ema12 - ema26
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
 
-    # Volume ratio
     df["vol_sma20"] = df["volume"].rolling(20).mean()
     df["v_ratio"] = df["volume"] / df["vol_sma20"]
 
     return df
 
 
-def detect_swings(df: pd.DataFrame, lookback: int = 2) -> pd.DataFrame:
+# ---------------------- Swing High/Low ---------------------- #
+
+def detect_swings(df, look=2):
     df["swing_high"] = False
     df["swing_low"] = False
 
-    for i in range(lookback, len(df) - lookback):
-        hi = df.at[i, "high"]
-        lo = df.at[i, "low"]
+    for i in range(look, len(df) - look):
+        h = df["high"].iloc[i]
+        l = df["low"].iloc[i]
 
-        is_high = True
-        is_low = True
-
-        for k in range(1, lookback + 1):
-            if not (hi > df.at[i - k, "high"] and hi > df.at[i + k, "high"]):
-                is_high = False
-            if not (lo < df.at[i - k, "low"] and lo < df.at[i + k, "low"]):
-                is_low = False
-
-        if is_high:
+        if all(h > df["high"].iloc[i-k] for k in range(1, look+1)) and \
+           all(h > df["high"].iloc[i+k] for k in range(1, look+1)):
             df.at[i, "swing_high"] = True
-        if is_low:
+
+        if all(l < df["low"].iloc[i-k] for k in range(1, look+1)) and \
+           all(l < df["low"].iloc[i+k] for k in range(1, look+1)):
             df.at[i, "swing_low"] = True
 
     return df
 
 
-def get_structure_state(df: pd.DataFrame, idx: int):
-    """
-    Son swing high/low'lara bakarak HH / HL / LH / LL durumu çıkarır.
-    """
-    highs = [i for i in range(idx + 1) if df.at[i, "swing_high"]]
-    lows = [i for i in range(idx + 1) if df.at[i, "swing_low"]]
+# ---------------------- HH / HL / LH / LL ---------------------- #
 
-    last_high_idx = prev_high_idx = None
-    last_low_idx = prev_low_idx = None
+def get_structure(df, idx):
+    highs = [i for i in range(idx+1) if df.at[i, "swing_high"]]
+    lows  = [i for i in range(idx+1) if df.at[i, "swing_low"]]
 
-    high_type = None
-    low_type = None
+    ht = lt = None
+    last_hi = last_lo = None
 
     if len(highs) >= 2:
-        prev_high_idx = highs[-2]
-        last_high_idx = highs[-1]
-        if df.at[last_high_idx, "high"] > df.at[prev_high_idx, "high"]:
-            high_type = "HH"
-        else:
-            high_type = "LH"
+        last_hi = highs[-1]
+        prev_hi = highs[-2]
+        ht = "HH" if df.at[last_hi, "high"] > df.at[prev_hi, "high"] else "LH"
 
     if len(lows) >= 2:
-        prev_low_idx = lows[-2]
-        last_low_idx = lows[-1]
-        if df.at[last_low_idx, "low"] > df.at[prev_low_idx, "low"]:
-            low_type = "HL"
-        else:
-            low_type = "LL"
+        last_lo = lows[-1]
+        prev_lo = lows[-2]
+        lt = "HL" if df.at[last_lo, "low"] > df.at[prev_lo, "low"] else "LL"
 
     struct_dir = "NEUTRAL"
-    if high_type == "HH" or low_type == "HL":
+    if ht == "HH" or lt == "HL":
         struct_dir = "UP"
-    if high_type == "LH" or low_type == "LL":
+    if ht == "LH" or lt == "LL":
         struct_dir = "DOWN"
 
     return {
-        "struct_dir": struct_dir,
-        "high_type": high_type,
-        "low_type": low_type,
-        "last_high_idx": last_high_idx,
-        "last_low_idx": last_low_idx,
+        "dir": struct_dir,
+        "high": ht,
+        "low": lt,
+        "hi_idx": last_hi,
+        "lo_idx": last_lo
     }
 
 
-def compute_trend_decision(df: pd.DataFrame, idx: int, whale_dir: str | None):
-    """
-    Trend kararı (C modeli):
-    - Market structure + EMA yönü zorunlu.
-    - MACD veya whale onayı -> toplam en az 3 kriter aynı yönde ise confirmed trend.
-    """
-    st = get_structure_state(df, idx)
-    struct_dir = st["struct_dir"]
+# ---------------------- Trend Onay (C modeli) ---------------------- #
+
+def trend_decision(df, idx, whale_dir):
+    st = get_structure(df, idx)
+    struct_dir = st["dir"]
 
     ema_dir = "UP" if df.at[idx, "ema_fast"] > df.at[idx, "ema_slow"] else "DOWN"
-    macd_dir = "UP" if df.at[idx, "macd"] > 0 else "DOWN"
+    macd_dir = "UP" if df.at[idx, "macd"] > df.at[idx, "macd_signal"] else "DOWN"
 
-    confirmed_dir = None
+    confirmed = None
 
     if struct_dir != "NEUTRAL" and struct_dir == ema_dir:
-        match_count = 2  # structure + ema
+        match = 2  # structure + EMA
 
         if macd_dir == struct_dir:
-            match_count += 1
+            match += 1
         if whale_dir == struct_dir:
-            match_count += 1
+            match += 1
 
-        if match_count >= 3:
-            confirmed_dir = struct_dir
+        if match >= 3:
+            confirmed = struct_dir
 
-    raw_dir = ema_dir  # always-in-market için fallback
     return {
-        "raw_dir": raw_dir,
-        "confirmed_dir": confirmed_dir,
-        "struct": st,
-        "ema_dir": ema_dir,
-        "macd_dir": macd_dir,
+        "raw": ema_dir,
+        "confirmed": confirmed,
+        "structure": st
     }
 
 
-def analyze_symbol(inst_id: str):
-    # 4H verisi
-    df4 = get_candles(inst_id, "4H", limit=200)
+# ---------------------- Ana Analiz ---------------------- #
+
+def analyze(inst):
+    df4 = get_candles(inst, "4H", 200)
     if df4 is None:
         raise RuntimeError("4H veri yok")
 
     df4 = add_indicators(df4)
     df4 = detect_swings(df4)
 
-    # 1D verisi
-    df1d = get_candles(inst_id, "1D", limit=120)
-    if df1d is None:
+    df1 = get_candles(inst, "1D", 120)
+    if df1 is None:
         raise RuntimeError("1D veri yok")
 
-    df1d = add_indicators(df1d)
-    df1d = detect_swings(df1d)
+    df1 = add_indicators(df1)
+    df1 = detect_swings(df1)
 
-    # Whale & net delta
-    whale_info = get_trades_whale(inst_id, limit=200)
-    net_delta = whale_info["net_delta"]
-    whale_category = whale_info["whale_category"]
-    whale_side_dir = whale_info["whale_side_dir"]
+    trade = get_trade_flow(inst)
+    net = trade["net"]
+    whale_cat = trade["cat"]
+    whale_side = trade["dir"]
 
     whale_dir = None
-    if abs(net_delta) > 100_000 and whale_side_dir is not None:
-        whale_dir = whale_side_dir
+    if abs(net) > 80_000 and whale_side is not None:
+        whale_dir = whale_side
 
-    last_idx = len(df4) - 1
-    prev_idx = len(df4) - 2
+    i4 = len(df4) - 1
+    p4 = len(df4) - 2
 
-    trend_now = compute_trend_decision(df4, last_idx, whale_dir)
-    trend_prev = compute_trend_decision(df4, prev_idx, None)
+    now = trend_decision(df4, i4, whale_dir)
+    prev = trend_decision(df4, p4, None)
 
     # 1D trend
-    last_1d_idx = len(df1d) - 1
-    st_1d = get_structure_state(df1d, last_1d_idx)
-    ema_dir_1d = "UP" if df1d.at[last_1d_idx, "ema_fast"] > df1d.at[last_1d_idx, "ema_slow"] else "DOWN"
+    s1 = get_structure(df1, len(df1)-1)
+    ema1 = "UP" if df1["ema_fast"].iloc[-1] > df1["ema_slow"].iloc[-1] else "DOWN"
 
-    day_dir = "NEUTRAL"
-    if st_1d["struct_dir"] == "UP" and ema_dir_1d == "UP":
-        day_dir = "UP"
-    elif st_1d["struct_dir"] == "DOWN" and ema_dir_1d == "DOWN":
-        day_dir = "DOWN"
-
-    v_ratio_now = df4.at[last_idx, "v_ratio"] if not math.isnan(df4.at[last_idx, "v_ratio"]) else 1.0
-    close_now = df4.at[last_idx, "close"]
-
-    struct_now = trend_now["struct"]
-    high_type = struct_now["high_type"]
-    low_type = struct_now["low_type"]
-    last_low_idx = struct_now["last_low_idx"]
-    last_high_idx = struct_now["last_high_idx"]
-
-    swing_range = None
-    last_low_price = None
-    last_high_price = None
-
-    if last_low_idx is not None and last_high_idx is not None:
-        last_low_price = df4.at[last_low_idx, "low"]
-        last_high_price = df4.at[last_high_idx, "high"]
-        swing_range = abs(last_high_price - last_low_price)
+    if s1["dir"] == "UP" and ema1 == "UP":
+        day = "UP"
+    elif s1["dir"] == "DOWN" and ema1 == "DOWN":
+        day = "DOWN"
     else:
-        swing_range = df4["high"].iloc[-20:].max() - df4["low"].iloc[-20:].min()
+        day = "NEUTRAL"
+
+    close = df4["close"].iloc[-1]
+    hi_idx = now["structure"]["hi_idx"]
+    lo_idx = now["structure"]["lo_idx"]
+
+    if hi_idx is not None and lo_idx is not None:
+        swing_range = abs(df4.at[hi_idx, "high"] - df4.at[lo_idx, "low"])
+    else:
+        swing_range = df4["high"].tail(20).max() - df4["low"].tail(20).min()
 
     return {
-        "inst_id": inst_id,
+        "inst": inst,
         "df4": df4,
-        "df1d": df1d,
-        "trend_now": trend_now,
-        "trend_prev": trend_prev,
-        "day_dir": day_dir,
-        "v_ratio_now": v_ratio_now,
-        "net_delta": net_delta,
-        "whale_category": whale_category,
+        "day": day,
+        "now": now,
+        "prev": prev,
+        "close": close,
+        "swing": swing_range,
+        "hi": hi_idx,
+        "lo": lo_idx,
+        "net": net,
+        "whale_cat": whale_cat,
         "whale_dir": whale_dir,
-        "close_now": close_now,
-        "last_low_price": last_low_price,
-        "last_high_price": last_high_price,
-        "swing_range": swing_range,
-        "high_type": high_type,
-        "low_type": low_type,
+        "v_ratio": df4["v_ratio"].iloc[-1],
+        "high_type": now["structure"]["high"],
+        "low_type": now["structure"]["low"]
     }
+def side_text(d):
+    return "LONG" if d == "UP" else "SHORT"
 
+def side_arrow(d):
+    return "🟢" if d == "UP" else "🔴"
 
-def dir_to_text(direction: str) -> str:
-    return "LONG" if direction == "UP" else "SHORT"
-
-
-def dir_to_arrow(direction: str) -> str:
-    return "🟢" if direction == "UP" else "🔴"
-
-
-def signal_strength_text(trend_dir: str, day_dir: str) -> str:
-    if day_dir == "NEUTRAL":
+def strength(now, day):
+    if day == "NEUTRAL":
         return "Nötr Sinyal"
-    if trend_dir == day_dir:
-        return "Güçlü Sinyal"
-    else:
-        return "Zayıf Sinyal (Karşı Trend)"
+    return "Güçlü Sinyal" if now == day else "Zayıf Sinyal (Karşı Trend)"
+
+def px(x):
+    return f"{x:,.2f}"
 
 
-def format_price(p: float, inst_id: str) -> str:
-    if "BTC" in inst_id or "ETH" in inst_id:
-        return f"{p:,.2f}"
-    return f"{p:,.4f}"
-# ----------------- Ana Akış ----------------- #
-
-def build_daily_summary(analyses: dict) -> str:
-    """
-    10:00 ve 22:00 (TR saati) için günlük özet.
-    Long/Short komutu VERMEZ, sadece piyasa durumu özetler.
-    """
-    lines = []
-    lines.append(f"📊 BTC & ETH Günlük Özet")
-    lines.append(f"Zaman: {ts()}")
-    lines.append("-" * 32)
-
-    for inst in SYMBOLS:
-        data = analyses.get(inst)
-        if not data:
-            continue
-
-        inst_id = data["inst_id"]
-        symbol_short = inst_id.split("-")[0]
-
-        tn = data["trend_now"]
-        day_dir = data["day_dir"]
-        v_ratio = data["v_ratio_now"]
-        net_delta = data["net_delta"]
-        whale_cat = data["whale_category"]
-        whale_dir = data["whale_dir"]
-        high_type = data["high_type"]
-        low_type = data["low_type"]
-
-        # 4H yön (confirmed varsa onu, yoksa raw)
-        trend_dir = tn["confirmed_dir"] or tn["raw_dir"]
-        trend_text = dir_to_text(trend_dir)
-        trend_arrow = dir_to_arrow(trend_dir)
-
-        # 1D trend
-        if day_dir == "UP":
-            day_text = "LONG"
-        elif day_dir == "DOWN":
-            day_text = "SHORT"
-        else:
-            day_text = "Nötr"
-
-        hhhl_text = []
-        if high_type:
-            color = "🟢" if high_type == "HH" else "🔴"
-            hhhl_text.append(f"{color} {high_type}")
-        if low_type:
-            color = "🟢" if low_type == "HL" else "🔴"
-            hhhl_text.append(f"{color} {low_type}")
-        ms_line = " | ".join(hhhl_text) if hhhl_text else "-"
-
-        whale_line = f"{whale_cat} / {net_delta:,.0f} USDT"
-        if whale_dir == "UP":
-            whale_line += " (Alım baskısı)"
-        elif whale_dir == "DOWN":
-            whale_line += " (Satış baskısı)"
-
-        lines.append(
-            f"\n{symbol_short}:\n"
-            f"- 4H Trend: {trend_arrow} {trend_text}\n"
-            f"- 1D Trend: {day_text}\n"
-            f"- Yapı (HH/HL/LH/LL): {ms_line}\n"
-            f"- vRatio: {v_ratio:.2f}\n"
-            f"- Whale: {whale_line}"
-        )
-
-    return "\n".join(lines)
-
+# ---------------------- MAIN ---------------------- #
 
 def main():
-    print(f"[INFO] Başladı: {ts()}")
+    print("[INFO] Başladı:", ts())
 
-    analyses: dict[str, dict] = {}
-    for inst in SYMBOLS:
+    A = {}
+    for s in SYMBOLS:
         try:
-            analyses[inst] = analyze_symbol(inst)
+            A[s] = analyze(s)
         except Exception as e:
-            print(f"[HATA] {inst} analizinde hata: {e}")
+            print("[HATA]", s, e)
 
-    if not analyses:
-        print("[HATA] Hiç enstrüman analiz edilemedi.")
+    if not A:
+        print("[HATA] Analiz yok.")
         return
 
-    # Önce trend değişimi var mı ona bak
-    any_trend_change = False
-    cmd_lines = []
-    detail_lines = []
+    # ---------------- Trend değişimi kontrol ---------------- #
+    trend_msg = []
+    detail = []
+    changed = False
 
-    for inst in SYMBOLS:
-        data = analyses.get(inst)
-        if not data:
+    for s in SYMBOLS:
+        d = A[s]
+        now = d["now"]["confirmed"]
+        prev = d["prev"]["confirmed"]
+        day = d["day"]
+
+        if now is None:
             continue
 
-        inst_id = data["inst_id"]
-        symbol_short = inst_id.split("-")[0]
+        if prev is None or prev != now:
+            changed = True
+            swing = d["swing"]
+            close = d["close"]
 
-        now_dir = data["trend_now"]["confirmed_dir"]
-        prev_dir = data["trend_prev"]["confirmed_dir"]
-        day_dir = data["day_dir"]
-
-        # confirmed yoksa komut vermeyeceğiz
-        if now_dir is None:
-            continue
-
-        # Trend değişimi: önceki confirmed farklıysa veya önce hiç confirmed yoksa
-        trend_changed = (prev_dir is not None and prev_dir != now_dir) or (prev_dir is None)
-
-        if trend_changed:
-            any_trend_change = True
-            side_text = dir_to_text(now_dir)
-            arrow = dir_to_arrow(now_dir)
-            strength = signal_strength_text(now_dir, day_dir)
-
-            close_now = data["close_now"]
-            swing_range = data["swing_range"] or 0.0
-            last_low = data["last_low_price"]
-            last_high = data["last_high_price"]
-
-            if now_dir == "UP":
-                if last_low is not None:
-                    sl = last_low
-                else:
-                    sl = close_now * 0.97
-
-                tp1 = close_now + swing_range * 0.5
-                tp2 = close_now + swing_range * 1.0
-                tp3 = close_now + swing_range * 1.5
+            if now == "UP":
+                sl = d["df4"]["low"].iloc[d["lo"]] if d["lo"] else close * 0.97
+                tp1 = close + swing * 0.5
+                tp2 = close + swing * 1.0
+                tp3 = close + swing * 1.5
             else:
-                if last_high is not None:
-                    sl = last_high
-                else:
-                    sl = close_now * 1.03
+                sl = d["df4"]["high"].iloc[d["hi"]] if d["hi"] else close * 1.03
+                tp1 = close - swing * 0.5
+                tp2 = close - swing * 1.0
+                tp3 = close - swing * 1.5
 
-                tp1 = close_now - swing_range * 0.5
-                tp2 = close_now - swing_range * 1.0
-                tp3 = close_now - swing_range * 1.5
-
-            cmd_lines.append(f"{arrow} {symbol_short} {side_text} AÇ ({strength})")
-
-            tn = data["trend_now"]
-            st = tn["struct"]
-            v_ratio = data["v_ratio_now"]
-            net_delta = data["net_delta"]
-            whale_cat = data["whale_category"]
-            whale_dir = data["whale_dir"]
-
-            high_type = data["high_type"]
-            low_type = data["low_type"]
-
-            hhhl_text = []
-            if high_type:
-                color = "🟢" if high_type == "HH" else "🔴"
-                hhhl_text.append(f"{color} {high_type}")
-            if low_type:
-                color = "🟢" if low_type == "HL" else "🔴"
-                hhhl_text.append(f"{color} {low_type}")
-            ms_line = " | ".join(hhhl_text) if hhhl_text else "-"
-
-            whale_line = f"{whale_cat} / {net_delta:,.0f} USDT"
-            if whale_dir == "UP":
-                whale_line += " (Alım baskısı)"
-            elif whale_dir == "DOWN":
-                whale_line += " (Satış baskısı)"
-
-            detail_lines.append(
-                f"\n{symbol_short}:\n"
-                f"- 4H Trend: {dir_to_text(now_dir)}\n"
-                f"- Yapı: {ms_line}\n"
-                f"- 4H Hacim Oranı (vRatio): {v_ratio:.2f}\n"
-                f"- Whale: {whale_line}\n"
-                f"- 1D Trend: {'LONG' if day_dir=='UP' else 'SHORT' if day_dir=='DOWN' else 'Nötr'}\n"
-                f"- SL: {format_price(sl, inst_id)}\n"
-                f"- TP1: {format_price(tp1, inst_id)}\n"
-                f"- TP2: {format_price(tp2, inst_id)}\n"
-                f"- TP3: {format_price(tp3, inst_id)}\n"
+            trend_msg.append(
+                f"{side_arrow(now)} {s.split('-')[0]} {side_text(now)} AÇ ({strength(now, day)})"
             )
 
-    if any_trend_change:
-        header = "⚠️ TREND DEĞİŞİMİ — 4H KAPANIŞI\n\n"
-        text = header + "\n".join(cmd_lines) + "\n" + "".join(detail_lines)
-        send_telegram(text)
-        print("[INFO] Trend değişimi mesajı gönderildi.")
-        return
+            # detay ekle
+            h = d["high_type"]
+            l = d["low_type"]
 
-    # Trend değişimi yoksa: önemli uyarı var mı?
-    warning_lines = []
-    for inst in SYMBOLS:
-        data = analyses.get(inst)
-        if not data:
-            continue
+            hh = []
+            if h: hh.append(("🟢" if h=="HH" else "🔴") + " " + h)
+            if l: hh.append(("🟢" if l=="HL" else "🔴") + " " + l)
+            ms = " | ".join(hh) if hh else "-"
 
-        inst_id = data["inst_id"]
-        symbol_short = inst_id.split("-")[0]
+            whale_line = f"{d['whale_cat']} / {d['net']:,.0f} USDT"
+            if d["whale_dir"] == "UP":
+                whale_line += " (Alım)"
+            elif d["whale_dir"] == "DOWN":
+                whale_line += " (Satış)"
 
-        v_ratio = data["v_ratio_now"]
-        net_delta = data["net_delta"]
-        whale_cat = data["whale_category"]
-        whale_dir = data["whale_dir"]
-        high_type = data["high_type"]
-        low_type = data["low_type"]
-
-        important_struct = high_type in ("HH", "LL") or low_type in ("HL", "LL")
-        big_volume = v_ratio >= 3.0
-        big_whale = whale_cat in ("L", "XL", "XXL")
-
-        if important_struct and (big_volume or big_whale):
-            struct_parts = []
-            if high_type:
-                color = "🟢" if high_type == "HH" else "🔴"
-                struct_parts.append(f"{color} {high_type}")
-            if low_type:
-                color = "🟢" if low_type == "HL" else "🔴"
-                struct_parts.append(f"{color} {low_type}")
-            struct_line = " | ".join(struct_parts)
-
-            whale_line = f"{whale_cat} / {net_delta:,.0f} USDT"
-            if whale_dir == "UP":
-                whale_line += " (Alım baskısı)"
-            elif whale_dir == "DOWN":
-                whale_line += " (Satış baskısı)"
-
-            warning_lines.append(
-                f"{symbol_short}:\n"
-                f"- Yapı: {struct_line}\n"
-                f"- vRatio: {v_ratio:.2f}\n"
+            detail.append(
+                f"\n{s.split('-')[0]}:\n"
+                f"- Yapı: {ms}\n"
                 f"- Whale: {whale_line}\n"
+                f"- vRatio: {d['v_ratio']:.2f}\n"
+                f"- 1D: {day}\n"
+                f"- SL: {px(sl)}\n"
+                f"- TP1: {px(tp1)}\n"
+                f"- TP2: {px(tp2)}\n"
+                f"- TP3: {px(tp3)}\n"
             )
 
-    if warning_lines:
-        text = "❗ ÖNEMLİ UYARI — 4H\n\n" + "\n".join(warning_lines)
+    if changed:
+        text = "⚠️ TREND DEĞİŞİMİ — 4H KAPANIŞ\n\n" + \
+               "\n".join(trend_msg) + "\n" + "".join(detail)
         send_telegram(text)
-        print("[INFO] Uyarı mesajı gönderildi.")
+        print("[INFO] Trend mesajı gönderildi.")
         return
 
-    # Önemli uyarı da yoksa: saat 10:00 veya 22:00 (TR) ise günlük özet gönder
-    now_utc = datetime.now(timezone.utc)
-    tr_hour = (now_utc.hour + 3) % 24  # Türkiye UTC+3
+    # ---------------- UYARI ---------------- #
 
-    if tr_hour in (10, 22):
-        summary_text = build_daily_summary(analyses)
-        send_telegram(summary_text)
-        print("[INFO] Günlük özet mesajı gönderildi.")
-    else:
-        print("[INFO] Gönderilecek trend değişimi, uyarı veya özet yok.")
+    warn = []
+    for s in SYMBOLS:
+        d = A[s]
+        important = d["high_type"] in ("HH", "LL") or d["low_type"] in ("HL", "LL")
+        big_v = d["v_ratio"] >= 3
+        big_w = d["whale_cat"] in ("L", "XL", "XXL")
+
+        if important and (big_v or big_w):
+            warn.append(f"{s}: Yapı={d['high_type']}/{d['low_type']} vRatio={d['v_ratio']:.1f} Whale={d['whale_cat']}")
+
+    if warn:
+        send_telegram("❗ Önemli 4H Uyarı:\n" + "\n".join(warn))
+        print("[INFO] Uyarı gönderildi.")
+        return
+
+    print("[INFO] Değişim yok, uyarı yok.")
 
 
 if __name__ == "__main__":
