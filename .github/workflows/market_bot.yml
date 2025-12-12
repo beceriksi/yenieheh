@@ -1,0 +1,32 @@
+name: market-direction-bot
+
+on:
+  schedule:
+    # Her 4 saatte bir (UTC) -> 4H kapanışlarını yakalar
+    - cron: "5 */4 * * *"
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repozitoriyi al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Bağımlılıkları yükle
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas
+
+      - name: Botu çalıştır
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python main.py
