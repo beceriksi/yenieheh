@@ -353,7 +353,21 @@ def px(x):
 # ---------------------- MAIN ---------------------- #
 
 def main():
-    print("[INFO] Başladı:", ts())
+    print("[INFO] Başladı:", ts()) 
+    print("\n--- DEBUG START ---")
+    for s in SYMBOLS:
+        try:
+            d = analyze(s)
+            print(f"\n{s}:")
+            print("  4H Confirmed Trend:", d["now"]["confirmed"])
+            print("  4H EMA Trend:", d["now"]["raw"])
+            print("  4H Structure:", d["now"]["structure"]["dir"])
+            print("  HH:", d["high_type"], "HL:", d["low_type"])
+            print("  Whale:", d["whale_cat"], d["net"], d["whale_dir"])
+            print("  1D Trend:", d["day"])
+        except Exception as e:
+            print("DEBUG ERROR:", s, e)
+    print("--- DEBUG END ---\n")
 
     A = {}
     for s in SYMBOLS:
