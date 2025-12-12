@@ -1,103 +1,115 @@
 import requests
 import time
+import datetime
 import numpy as np
-import pandas as pd
-from datetime import datetime
+import talib
+import os
 
-# OKX API endpoint
-BASE_URL = "https://www.okx.com"
-CANDLES_ENDPOINT = "/api/v5/market/candles"
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-# Telegram
-TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+SYMBOLS = ["BTC-USDT", "ETH-USDT", "BNB-USDT", "XRP-USDT", "SOL-USDT"]
+INTERVAL = 14400  # 4 saat
+LIMIT = 200
 
-COINS = ["BTC-USDT", "ETH-USDT"]  # genişletilebilir
-INTERVAL = "4H"
+OKX_ENDPOINT = "https://www.okx.com"
 
 
-def get_klines(symbol):
-    url = BASE_URL + CANDLES_ENDPOINT
-    params = {
-        "instId": symbol,
-        "bar": INTERVAL,
-        "limit": 100
-    }
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
+    requests.post(url, data=payload)
+
+
+def fetch_ohlcv(symbol):
+    url = f"{OKX_ENDPOINT}/api/v5/market/candles"
+    params = {"instId": symbol, "bar": "4H", "limit": str(LIMIT)}
+    response = requests.get(url, params=params)
     try:
-        response = requests.get(url, params=params)
-        data = response.json()
-        df = pd.DataFrame(data['data'], columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume', '_1', '_2', '_3', '_4', '_5'])
-        df['close'] = df['close'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['rsi'] = compute_rsi(df['close'], 14)
-        df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
-    except Exception as e:
-        print(f"[HATA] {symbol} veri çekilemedi: {e}")
+        data = response.json()["data"]
+        closes = [float(c[4]) for c in reversed(data)]
+        highs = [float(c[2]) for c in reversed(data)]
+        lows = [float(c[3]) for c in reversed(data)]
+        volumes = [float(c[5]) for c in reversed(data)]
+        return closes, highs, lows, volumes
+    except:
+        print(f"[HATA] {symbol} verisi çekilemedi.")
+        return [], [], [], []
+
+
+def detect_trend_reversals(closes):
+    pivots = []
+    for i in range(2, len(closes)-2):
+        if closes[i] > closes[i-1] and closes[i] > closes[i+1]:
+            pivots.append((i, 'tepe'))
+        elif closes[i] < closes[i-1] and closes[i] < closes[i+1]:
+            pivots.append((i, 'dip'))
+    return pivots
+
+
+def detect_rsi_divergence(closes):
+    rsi = talib.RSI(np.array(closes), timeperiod=14)
+    if len(rsi) < 20:
         return None
-
-
-def compute_rsi(series, period):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-
-def detect_peaks(df):
-    peaks, troughs = [], []
-    for i in range(2, len(df) - 2):
-        if df['high'][i] > df['high'][i - 1] and df['high'][i] > df['high'][i + 1]:
-            peaks.append((df['datetime'][i], df['high'][i]))
-        if df['low'][i] < df['low'][i - 1] and df['low'][i] < df['low'][i + 1]:
-            troughs.append((df['datetime'][i], df['low'][i]))
-    return peaks, troughs
-
-
-def detect_rsi_divergence(df):
-    latest_rsi = df['rsi'].iloc[-1]
-    prev_rsi = df['rsi'].iloc[-5]
-    if latest_rsi > 70 and latest_rsi < prev_rsi:
-        return "Negative RSI divergence (olası düşüş)"
-    elif latest_rsi < 30 and latest_rsi > prev_rsi:
-        return "Positive RSI divergence (olası yükseliş)"
+    if closes[-1] > closes[-2] and rsi[-1] < rsi[-2]:
+        return "Negatif RSI uyumsuzluğu (Düşüş sinyali)"
+    elif closes[-1] < closes[-2] and rsi[-1] > rsi[-2]:
+        return "Pozitif RSI uyumsuzluğu (Yükseliş sinyali)"
     return None
 
 
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg
-    }
-    try:
-        r = requests.post(url, data=payload)
-        if not r.ok:
-            print("[Telegram] Mesaj gönderilemedi.")
-    except Exception as e:
-        print(f"[Telegram] Hata: {e}")
+def detect_macd_signal(closes):
+    macd, signal, _ = talib.MACD(np.array(closes), fastperiod=12, slowperiod=26, signalperiod=9)
+    if macd[-1] > signal[-1] and macd[-2] < signal[-2]:
+        return "MACD Golden Cross (Yükseliş sinyali)"
+    elif macd[-1] < signal[-1] and macd[-2] > signal[-2]:
+        return "MACD Death Cross (Düşüş sinyali)"
+    return None
+
+
+def is_volume_supporting(volumes):
+    recent = np.mean(volumes[-5:])
+    past = np.mean(volumes[-15:-5])
+    return recent > past * 1.2
+
+
+def analyze_symbol(symbol):
+    closes, highs, lows, volumes = fetch_ohlcv(symbol)
+    if len(closes) < 20:
+        return
+
+    trend_points = detect_trend_reversals(closes)
+    rsi_divergence = detect_rsi_divergence(closes)
+    macd_signal = detect_macd_signal(closes)
+    volume_ok = is_volume_supporting(volumes)
+
+    message = f"\n\n--- {symbol} 4H Analiz ---"
+    last_pivot = trend_points[-1] if trend_points else None
+
+    if last_pivot:
+        tip = "Tepe" if last_pivot[1] == 'tepe' else "Dip"
+        message += f"\nTrend dönüş noktası: {tip}"
+
+    if rsi_divergence:
+        message += f"\n{rsi_divergence}"
+
+    if macd_signal:
+        message += f"\n{macd_signal}"
+
+    if volume_ok:
+        message += f"\nHacim desteği mevcut."
+    else:
+        message += f"\nHacim düşük."
+
+    if rsi_divergence or macd_signal:
+        send_telegram_message(message)
 
 
 def main():
-    for coin in COINS:
-        df = get_klines(coin)
-        if df is None or df.empty:
-            continue
-        peaks, troughs = detect_peaks(df)
-        signal = detect_rsi_divergence(df)
-
-        msg = f"\n[{coin}]\nSon 4 saatlik analiz:"
-        if peaks:
-            msg += f"\nSon Tepe: {peaks[-1][1]} @ {peaks[-1][0]}"
-        if troughs:
-            msg += f"\nSon Dip: {troughs[-1][1]} @ {troughs[-1][0]}"
-        if signal:
-            msg += f"\nRSI Sinyali: {signal}"
-
-        send_telegram(msg)
+    while True:
+        for symbol in SYMBOLS:
+            analyze_symbol(symbol)
+        time.sleep(14400)  # 4 saat bekle
 
 
 if __name__ == "__main__":
